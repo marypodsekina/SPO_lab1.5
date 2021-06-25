@@ -1,0 +1,105 @@
+#include "../api/api.h"
+#include "../parser/parser.h"
+
+#define D(...) fprintf(new_stream, __VA_ARGS__)
+
+int main() {
+    init();
+
+    int sock;
+    struct sockaddr_in name;
+    char buf[MAX_MSG_LENGTH] = {0};
+    char *response;
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) perro("opening socket");
+
+    int optval = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof optval);
+
+    name.sin_family = AF_INET;
+    name.sin_addr.s_addr = INADDR_ANY;
+    name.sin_port = htons(PORT);
+    if (bind(sock, (void *) &name, sizeof(name))) perro("binding tcp socket");
+    if (listen(sock, 1) == -1) perro("listen");
+
+    struct sockaddr cli_addr;
+    int cli_len = sizeof(cli_addr);
+    int new_sock, new_fd, pid;
+    FILE *new_stream;
+
+    new_fd = dup(STDERR_FILENO) == -1;
+    if (new_fd) perro("dup");
+    new_stream = fdopen(new_fd, "w");
+    setbuf(new_stream, NULL);
+
+    D("Initializing server...\n");
+    new_sock = accept(sock, &cli_addr, &cli_len);
+    while (new_sock) {
+        D("Client connected.\nForking... ");
+        if (pid = fork()) D("child pid = %d.\n", pid);
+        else {
+            pid = getpid();
+            if (new_sock < 0) perro("accept");
+            if (dup2(new_sock, STDOUT_FILENO) == -1) perro("dup2");
+            if (dup2(new_sock, STDERR_FILENO) == -1) perro("dup2");
+            while (1) {
+                int readc = 0, filled = 0;
+                while (1) {
+                    readc = recv(new_sock, buf + filled, MAX_MSG_LENGTH - filled - 1, 0);
+                    if (!readc) break;
+                    filled += readc;
+                    if (buf[filled - 1] == '\0') break;
+
+                }
+                if (!readc) {
+                    D("\t[%d] Client disconnected.\n", pid);
+                    break;
+                }
+                buf[strcspn(buf, "\n")] = 0;
+                D("\t[%d] Command received: %s\n", pid, buf);
+                D("\t[%d] Parsing command.\n", pid);
+                api_t *api_struct = parse_cmd_to_api_struct(buf);
+                D("\t[%d] Resolving command.\n", pid);
+                switch (api_struct->command) {
+                    case CREATE: {
+                        response = apiCreate(api_struct->paths[0]->actualPath, api_struct->elem_n,
+                                             api_struct->elems, new_stream);
+                        send(new_sock, response, strlen(response), 0);
+                        break;
+                    }
+                    case READ: {
+                        response = apiRead(api_struct->path_n, api_struct->paths, api_struct->fromRoot, new_stream);
+                        send(new_sock, response, strlen(response), 0);
+                        break;
+                    }
+                    case UPDATE: {
+                        response = apiUpdate(api_struct->paths[0]->actualPath, api_struct->elem_n,
+                                             api_struct->elems, new_stream);
+                        send(new_sock, response, strlen(response), 0);
+                        break;
+                    }
+                    case DELETE: {
+                        response = apiDelete(api_struct->paths[0]->actualPath, new_stream);
+                        send(new_sock, response, strlen(response), 0);
+                        break;
+                    }
+                    default: {
+                        strcpy(response, "{\"error\": \"unexpected_command\"}");
+                        break;
+                    }
+                }
+                D("\t[%d] Finished executing command.\n", pid);
+                bson_free(response);
+                send(new_sock, "\n>\t", 3, MSG_NOSIGNAL);
+            }
+            close(new_sock);
+            D("\t[%d] Dying.\n", pid);
+            exit(0);
+        }
+        new_sock = accept(sock, &cli_addr, &cli_len);
+    }
+    fclose(new_stream);
+    close(sock);
+    return 0;
+}
